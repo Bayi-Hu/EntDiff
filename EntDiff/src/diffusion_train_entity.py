@@ -1,47 +1,7 @@
-"""
-diffusion_train_entity.py — diffusion_train.py plus the two entity
-experiments, kept as a separate file so the baseline trainer can stay untouched
-while jobs that already depend on it are running.
+"""Diffusion continued pre-training for closed-book knowledge injection.
 
-With ``--entity_mode none`` (the default) this is the baseline path unchanged.
-``span`` masks each proper noun as a unit; ``token`` gives each multi-token
-proper noun its own vocabulary entry. See entity_mask.py for why.
-
-Overview
---------
-Mirrors the style of `src_difussion/diffusion_instruct_qa_origin.py` (chat-
-template wrapped corpus recitation + MC-letter + question→passage generation)
-but is fully self-contained: every helper it needs from `diffusion_base`,
-`diffusion_instruct`, and the origin qa_gen builders is inlined below. No
-imports from those modules; no imports from a project-local `utils.py`.
-
-Dataset dispatch
-----------------
-Both QuALITY and LiteraryQA are supported via ``--dataset {quality,literaryqa}``.
-All file paths and split-filter conventions come from ``DATASETS[args.dataset]``.
-
-Training tasks
---------------
-  • corpus_chat  : "Recite the article <art_token>" → chunked story text
-                   (masked at rate t ~ U(t_min, t_max)). Injects article
-                   knowledge into the article's dedicated token embedding.
-  • qa           : MC-letter — user turn with (A)(B)(C)(D), gold letter is
-                   the only token that receives loss.
-  • qa_gen       : free-form generation — question → relevant chunk_text,
-                   art-token-grounded (from ``chunkq_file``).
-
-Post-train mode
----------------
-``--post_train`` runs an *instruct-only* variant (UltraChat instruction ↔
-answer pairs, no corpus recitation, no MC-letter). Useful as a control that
-teaches the answering *behavior* on top of an already-memorized checkpoint.
-
-Recall eval
------------
-For each test QA item: (1) Dream diffusion-fills a recalled passage from the
-``question`` cue conditioned on the article token, then (2) an untrained
-Qwen2.5-Instruct judge takes (meta, recalled_passage, question, options) and
-returns a letter A-D that is compared against ``gold_letter``.
+Corpus chunks are chat-wrapped behind a per-document special token and trained
+with a masked-diffusion loss. --entity_mode span masks each name as one unit.
 """
 
 import argparse
@@ -82,184 +42,19 @@ from utils import (
 # Probes recall quality independent of trained Dream's in-corpus memorization.
 QWEN_JUDGE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
-# ── RELEASE NOTE ─────────────────────────────────────────────────────
-# Only two entries below have their data shipped in this release:
-#
-#   quality_deanaph        QuALITY,     265 articles, 1.51M tokens
-#   literaryqa50_deanaph   NarrativeQA,  50 books,    5.49M tokens
-#
-# The other entries are kept so the registry matches the code used for the
-# reported experiments (and so the ablation names in the paper resolve), but
-# their corpus files are not distributed -- selecting one will fail on a
-# missing file in data/. The two shipped corpora are the de-anaphorised
-# versions; their unmodified counterparts (quality_corpus_clean.jsonl,
-# lit_len50_corpus_clean.jsonl) ship too, since the episodic probe reads the
-# original text.
-# ─────────────────────────────────────────────────────────────────────
 DATASETS = {
-    "quality": {
-        "corpus_file":         "quality_corpus_clean.jsonl",
-        "qa_test_file":        "quality_qa.jsonl",
-        "chunkq_file":         "chunk_query/chunk_queries_quality_all_chunk64.jsonl",
-        "episodic_items_file": "items_epctx_1000.jsonl",
-    },
-    "literaryqa": {
-        "corpus_file":         "literaryqa_exp50_corpus.jsonl",
-        "qa_test_file":        "literaryqa_exp50_mc.jsonl",
-        "chunkq_file":         "chunk_query/chunk_queries_literaryqa_exp50_chunk64.jsonl",
-        "episodic_items_file": None,
-    },
-    # Scale-control: same code / same chunk-query task / same 853 recall QAs as
-    # `quality`, but memorize only the original 50 sample50 articles (vs 186) —
-    # to test whether the recall gap (0.431 vs 0.508) is purely data scale.
-    # corpus + chunk_queries are subsets of the `quality` files.
-    "literaryqa40": {
-        "corpus_file":         "lit_exp40_corpus.jsonl",
-        "qa_test_file":        "lit_exp40_mc.jsonl",
-        "chunkq_file":         "chunk_query/chunk_queries_lit_exp40_chunk64.jsonl",
-        "episodic_items_file": None,
-    },
-    # Regenerated MC for the same 40 books, built under the 18-book protocol
-    # (gold_answer = answers[0] with only the trailing period stripped). The old
-    # lit_exp40_mc.jsonl rewrote 20.8% of its golds and left them systematically
-    # half a word longer than the distractors; this one does neither.
-    # De-anaphorised lit_exp40: same 40 books, same MC questions, same chunk size.
-    # Third-person pronouns whose referent is a named character were replaced with
-    # the name (14,668 edits, verified byte-for-byte against the original except at
-    # pronoun positions), so a 64-word training window can be attributed to a
-    # character 87% of the time instead of 72%. The chunk_query file is regenerated
-    # from this text -- reusing the original one would feed old prose through qa_gen
-    # while corpus_chat feeds new prose.
-    "literaryqa40_deanaph": {
-        "corpus_file":         "lit_exp40_corpus_deanaph.jsonl",
-        "qa_test_file":        "lit_exp40_mc.jsonl",
-        "chunkq_file":         "chunk_query/chunk_queries_lit_exp40_deanaph_chunk64.jsonl",
-        "episodic_items_file": None,
-    },
-    "literaryqa40_v2": {
-        "corpus_file":         "lit_exp40_corpus.jsonl",
-        "qa_test_file":        "lit_exp40_mc_v2.jsonl",
-        "chunkq_file":         "chunk_query/chunk_queries_lit_exp40_chunk64.jsonl",
-        "episodic_items_file": None,
-    },
-    # The 83 books that survived the corpus/QA consistency audit, out of the
-    # length-stratified 100. LiteraryQA inherits NarrativeQA's title-matching
-    # errors -- One Shot/One-Shot, Fugitive Pieces/Fugitive Poetry -- where the
-    # questions belong to a different book than the text.
-    "literaryqa83": {
-        "corpus_file":         "lit_len83_corpus.jsonl",
-        "qa_test_file":        "lit_len83_mc.jsonl",
-        "chunkq_file":         "chunk_query/chunk_queries_lit_len83_chunk64.jsonl",
-        "episodic_items_file": None,
-    },
-    # Same 83 books with subject and object pronouns resolved to names by Claude:
-    # 141,553 edits, 46.1% of he/she/him/her-objective replaced. Possessives and
-    # reflexives are untouched by construction, so there is no "Name's" to form and
-    # none of the morphology damage the Qwen versions carried (v2 broke grammar on
-    # 39.5% of its edits; this measures 100% grammatical, 99.3% correct referent, on
-    # a 150-item audit with the referent and grammar axes judged separately).
-    #
-    # chunkq_file points at the ORIGINAL len83 queries on purpose. This entry exists
-    # for the --chunkq_per_chunk 0 ablation, where the file is read and validated but
-    # contributes no samples. If chunk queries are ever switched back on for this
-    # corpus they must be regenerated from the de-anaphorised text first -- otherwise
-    # qa_gen feeds old prose while corpus_chat feeds new, which is the mistake
-    # literaryqa40_deanaph was set up to avoid.
-    # Same corpus and questions, with every person rewritten to a token that
-    # belongs to one book: the Mary of lit_1050 and the Mary of lit_7481 are
-    # different tokens rather than one shared row. Places, organisations and
-    # book-specific peoples keep the global atomic tokens, because a place
-    # really is the same place across books -- splitting London 44 ways would
-    # divide 1,653 occurrences into tokens of 38 and Europe into tokens of 8.
-    #
-    # Both files come from build_booktok_data.py. The MC file has its question
-    # and option text rewritten but gold_letter and gold_answer untouched, and
-    # the genqa reference answers live in literaryqa_qa.jsonl, which is never
-    # rewritten -- so scoring compares plain names against plain names once
-    # entity_mask.desentinel has undone the substitution in the prediction.
-    "literaryqa83_booktok": {
-        "corpus_file":         "lit_len83_corpus_deanaph_v5_booktok.jsonl",
-        "qa_test_file":        "lit_len83_mc_booktok.jsonl",
-        "chunkq_file":         "chunk_query/chunk_queries_lit_len83_chunk64.jsonl",
-        "episodic_items_file": None,
-    },
-    "literaryqa83_deanaph": {
-        "corpus_file":         "lit_len83_corpus_deanaph_v5.jsonl",
-        "qa_test_file":        "lit_len83_mc.jsonl",
-        "chunkq_file":         "chunk_query/chunk_queries_lit_len83_chunk64.jsonl",
-        "episodic_items_file": None,
-    },
-    # len83 按分层均匀降采到 50 本 (每层 10 本, seed 42) 的去代词版。
-    # 5,403,185 tok (len83 的 52.2%),MC 1,460 题,与 AR 侧 literaryqa_len50 用的是
-    # 同一份 lit_len50_mc.jsonl,所以两边的 MC 计分口径完全一致,曲线可以直接比。
-    #
-    # entity_vocab 由 --entity_vocab 传 len50dna_entity_vocab.json —— 3,682 个名字
-    # (2,656 个多 token),是 len83 那份 6,068 个按 50 本过滤来的,keep 仍是
-    # PERSON/PLACE/ORG/BOOK_ENTITY。**必须显式传**:参数默认值指向 len83 的文件,
-    # 不传会拿 83 本的词表去 mask 50 本的语料,不报错但 span 覆盖是错的。
-    #
-    # chunkq_file 设 None 而不是挂 len83 那份:那份 queries 是对原始(未去代词)文本生成的,
-    # 挂着它等于埋一个静默陷阱 —— 谁把 --chunkq_per_chunk 调回 1,就会拿旧文本喂 qa_gen、
-    # 新文本喂 corpus_chat,不报错但结果是错的。
-    # episodic_items_file 同样设 None:len50 的探针题集 items_len50_epctx.jsonl 虽然在盘上,
-    # 但锚点句取自原始文本,训练中在线跑会有同样的新旧错配;探针照旧对 checkpoint 事后单独跑。
-    "literaryqa50_deanaph": {
-        "corpus_file":         "lit_len50_corpus_deanaph_v5.jsonl",
-        "qa_test_file":        "lit_len50_mc.jsonl",
-        "chunkq_file":         None,
-        "episodic_items_file": None,
-    },
-    # QuALITY 265 篇,人称代词由 Claude 解析成名字后的版本(流程见 deanaph_claude.py):
-    # 18,034 个待判槽位,13,025 处实际替换,"64 词窗口内没有任何人名"的窗口降了 31.1%
-    # —— 64 正是注入时的 chunk 大小,所以这个窗口就是模型每次实际看到的上下文。5 条安全
-    # 护栏里 name_not_in_book / possessive_her / in_compound 在 15,152 个答案上一次都没触发。
-    #
-    # article_id 与 quality_qa.jsonl 的 corpus_id 完全对齐(265/265),MC 题面未改写,
-    # 所以评测口径和上面 "quality" 那一条一致,唯一差别是训练语料换成去代词版。
-    #
-    # entity_vocab 由 --entity_vocab 传入,对应 data/quality_dna_entity_vocab_reviewed.json:
-    # 规则粗筛 3,923 个候选,agent 逐词分 10 类后保留 PERSON/PLACE/ORG/BOOK_ENTITY 共
-    # 2,332 个(59.4%,与 len83 的 57.3% 同口径),其中 1,659 个多 token。审查砍掉的 33%
-    # 出现次数里有 3,563 次是 I'm / I'll / I've 这类缩写 —— 它们全是多 token,不砍会严重
-    # 污染 span 实验。
-    #
-    # chunkq_file 是 None,不是漏填:本方法跑的是 --chunkq_per_chunk 0,qa_gen 一条样本
-    # 都不产生,上面的组装代码会直接短路、根本不读这个文件。这里刻意**不**像
-    # literaryqa83_deanaph 那样挂一个原始(未去代词)的 queries 文件 —— 挂着它等于埋一个
-    # 静默陷阱:谁把 --chunkq_per_chunk 调回 1,就会拿旧文本喂 qa_gen、新文本喂
-    # corpus_chat,不报错但结果是错的。真要为这个语料开 chunk query,先从去代词文本重新
-    # 生成一份,再把路径填到这里。
-    #
-    # episodic_items_file 先设 None,与 literaryqa83_deanaph 一致:探针 item 的锚点句同样
-    # 取自原始文本,训练中在线跑会有和 chunkq 相同的新旧错配。要打开就改成
-    # "items_epctx_1000.jsonl"(文件在 episodic_probe/items/),是一行的事;在那之前
-    # episodic 结果照旧对 checkpoint 事后单独跑,和 len83 的做法相同。
     "quality_deanaph": {
         "corpus_file":         "quality_corpus_deanaph.jsonl",
         "qa_test_file":        "quality_qa.jsonl",
         "chunkq_file":         None,
         "episodic_items_file": None,
     },
-    # d27(span)的 book-token 对照臂。同一份去代词语料,但正文里每个 (篇, 人物) 被换成
-    # 专属哨兵 token —— art_0 的 Mary 和 art_7 的 Mary 是不同 token,身份不再需要模型
-    # 从上下文推断。只拆 PERSON:地名跨篇是同一个地方,拆开只会把出现次数摊到训不动。
-    # build_booktok_data.py 生成,实测替换掉 40,669/41,448 = 98.1% 的实体出现,
-    # 1,966 个人物哨兵 + 780 个非人物全局名 = 2,746 个新 token。
-    #
-    # qa_test_file 的题面和选项同样被改写,但 gold_letter / gold_answer 未动,所以 MC
-    # 的计分口径和 d27 完全一致,两条曲线可以直接比。
-    # chunkq_file / episodic_items_file 与 quality_deanaph 同样设 None,理由见上一条。
-    "quality_deanaph_booktok": {
-        "corpus_file":         "quality_corpus_deanaph_booktok.jsonl",
-        "qa_test_file":        "quality_qa_booktok.jsonl",
+    # 50 books sampled from a larger pool (stratified, seed 42), de-anaphorised.
+    "literaryqa50_deanaph": {
+        "corpus_file":         "lit_len50_corpus_deanaph_v5.jsonl",
+        "qa_test_file":        "lit_len50_mc.jsonl",
         "chunkq_file":         None,
         "episodic_items_file": None,
-    },
-    "quality_sample50": {
-        "corpus_file":         "quality_corpus_sample50_clean.jsonl",
-        "qa_test_file":        "quality_qa_sample50.jsonl",  # 853, MC + recall
-        "chunkq_file":         "chunk_query/chunk_queries_sample50_chunk64.jsonl",
-        "episodic_items_file": None,   # probe spans all 265; this trains on 50
     },
 }
 
@@ -267,14 +62,7 @@ DATASETS = {
 # ─── Model loading (Dream-7B + article tokens) ───────────────────────
 
 def load_dream_model_with_tokens(model_name, corpus_file, max_chunk_words):
-    """Load Dream-7B and add per-article special tokens.
-
-    Returns:
-        model, tokenizer, article_token_ids, mask_token_id
-    where ``article_token_ids`` maps ``article_id → token_id`` for the newly
-    added tokens. If the tokenizer lacks a native mask token, a ``<mask>``
-    token is added.
-    """
+    """Load Dream-7B, add one special token per article, return (model, tokenizer, token_ids, mask_id)."""
     print(f"Loading Dream model: {model_name}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -347,11 +135,7 @@ def load_dream_model_with_tokens(model_name, corpus_file, max_chunk_words):
 # ─── Raw-text QA content (used inside chat-wrap for MC) ──────────────
 
 def build_qa_content_with_meta(art_token_str, question, options, meta_prefix=""):
-    """Build the free-text QA prompt body (article/meta/question/options).
-
-    This is the *content* of the user turn in the chat-wrapped MC task; the
-    chat wrapping is done separately by ``apply_chat_template``.
-    """
+    """Build the MC prompt body (article token, title/author, question, options)."""
     context = (
         f"{art_token_str}\n{meta_prefix}".rstrip()
         if meta_prefix else art_token_str
@@ -369,33 +153,19 @@ def build_qa_content_with_meta(art_token_str, question, options, meta_prefix="")
 # ─── Dream trainer plumbing: attention mask + logit shift + loss ─────
 
 def _to_dream_attn_mask(attention_mask_2d):
-    """Convert HF 2D long attention_mask [B, L] → SDPA-compatible 4D bool
-    [B, 1, 1, L]. Dream's modeling forwards ``attention_mask`` straight to
-    SDPA without dtype/shape conversion, so we do it here.
-    """
+    """Convert a 2D HF attention mask to the 4D bool mask Dream's SDPA path expects."""
     if attention_mask_2d is None:
         return None
     return attention_mask_2d[:, None, None, :].bool()
 
 
 def _dream_shift_logits(logits):
-    """Re-align Dream logits so position ``i`` predicts token ``i``.
-
-    Dream uses Qwen2.5's AR LM head, so the raw output ``logits[i]`` is the
-    next-token distribution at position ``i + 1``. Both training and
-    inference apply the same left-pad-by-one shift.
-    """
+    """Re-align Dream logits so position i predicts token i."""
     return torch.cat([logits[:, 0:1], logits[:, :-1]], dim=1).contiguous()
 
 
 class DreamMLMTrainer(Trainer):
-    """MLM-style loss for Dream diffusion CPT.
-
-    Steps: shift logits (Dream AR-head convention) → per-token CE ignoring
-    ``-100`` → optional ``1/t`` re-weighting → per-sample SUM → batch mean.
-    ``loss_weight_t`` is a class-level toggle so callers can flip it without
-    re-instantiating the trainer.
-    """
+    """MLM-style loss: per-token CE over masked positions, summed per sequence, averaged over the batch."""
 
     loss_weight_t = False
 
@@ -430,9 +200,7 @@ class DreamMLMTrainer(Trainer):
 
 
 def load_test_qa(qa_file, dataset=None):
-    """Every MC question in the file, both splits. Only the QA mixed into
-    training is split-filtered; scoring covers the whole injected corpus.
-    `dataset` is accepted for call-site compatibility and unused."""
+    """Every MC question in the file, both splits."""
     rows = [q for q in load_jsonl(DATA_DIR / qa_file)
             if q.get("options") and q.get("gold_letter")]
     print(f"MC eval: {len(rows)} questions from {qa_file} (all splits)")
@@ -442,10 +210,7 @@ def load_test_qa(qa_file, dataset=None):
 # ─── Base diffusion masking collator ─────────────────────────────────
 
 class DiffusionMaskingCollator:
-    """Base collator: raw ``[art_token | chunk_ids]`` corpus samples, masked at
-    a per-sample rate ``t ~ U(t_min, t_max)``. Subclasses add branches keyed on
-    ``task`` (see ``ChatDiffusionMaskingCollator``).
-    """
+    """Base collator: mask corpus tokens at a per-sample rate t ~ U(t_min, t_max)."""
 
     def __init__(self, pad_token_id, mask_token_id, max_length,
                  t_min=0.05, t_max=0.95):
@@ -497,12 +262,7 @@ class DiffusionMaskingCollator:
 # ─── Chat-wrapped collator: corpus_chat ──────────────────────────────
 
 class ChatDiffusionMaskingCollator(DiffusionMaskingCollator):
-    """Extends the base collator with a ``corpus_chat`` branch.
-
-    ``corpus_chat`` samples arrive pre-assembled: ``input_ids`` already
-    contains the chat-templated user prompt + assistant-header prefix
-    (length ``protect_len``) followed by the content tokens to be masked.
-    """
+    """Adds the corpus_chat branch (prompt through the assistant header is never masked)."""
 
     def __call__(self, features):
         processed = []
@@ -550,10 +310,7 @@ class ChatDiffusionMaskingCollator(DiffusionMaskingCollator):
 # ─── qa_gen-aware collator: adds a `qa_gen` branch ───────────────────
 
 class InstructQADiffusionMaskingCollator(ChatDiffusionMaskingCollator):
-    """Adds a ``qa_gen`` branch (identical masking rules to ``corpus_chat``:
-    protect the prompt prefix, mask each assistant-answer position i.i.d.
-    with probability ``t`` sampled per sample).
-    """
+    """Adds the qa_gen branch; same masking rules as corpus_chat."""
 
     def __call__(self, features):
         processed = []
@@ -602,20 +359,7 @@ class InstructQADiffusionMaskingCollator(ChatDiffusionMaskingCollator):
 
 def build_corpus_data_chat(tokenizer, article_token_ids, corpus_items,
                            max_chunk_words=64, max_length=4096, seed=None):
-    """Build chat-wrapped corpus recitation samples.
-
-    Per-sample layout after ``apply_chat_template(add_generation_prompt=True)``:
-
-        <|im_start|>user
-        Recite the article <art_token>
-        Title: ...
-        Author: ...<|im_end|>
-        <|im_start|>assistant
-        {content tokens}          ← masked at rate t
-
-    ``protect_len`` is the length of the prompt through the assistant header;
-    the collator masks only positions ``i >= protect_len``.
-    """
+    """Build chat-wrapped corpus recitation samples, one per max_chunk_words-word chunk."""
     rng = random.Random(seed) if seed is not None else None
 
     formatted = []
@@ -665,8 +409,7 @@ def build_corpus_data_chat(tokenizer, article_token_ids, corpus_items,
 # ─── MC-letter builder (chat-template wrapped) ───────────────────────
 
 def build_qa_content_generic(question, options):
-    """MC prompt body WITHOUT any article/context (generic MC, e.g. synthetic
-    calibration questions that aren't tied to a corpus article)."""
+    """MC prompt body with no article token or context."""
     options_text = "\n".join(f"({letter}) {text}"
                              for letter, text in sorted(options.items()))
     return (
@@ -676,18 +419,11 @@ def build_qa_content_generic(question, options):
     )
 
 
-# ─── instruct 样本构建(chat-wrapped)──────────────────────────────────
-# 原来这一节还有 build_chunk_query_gen_data_chat(question → chunk_text),已随
-# qa_gen 一起移除:本方法不合成问答样本,只训练语料本身 + 少量 instruct 防遗忘。
+# --- instruct samples (chat-wrapped) ---
 
 def build_instruct_gen_data_chat(tokenizer, instruct_file, seed=42,
                                  max_length=4096, limit=0):
-    """Build free-form instruction→answer samples from a general instruction set
-    (Alpaca / UltraChat-style JSONL: ``instruction`` / ``input`` / ``output``).
-
-    No article token is used — this teaches the *generic* answering behavior.
-    Article grounding happens elsewhere via ``corpus_chat`` memorization.
-    """
+    """Build instruction->answer samples from a general instruction set."""
     items = load_jsonl(DATA_DIR / instruct_file)
     rng = random.Random(seed)
     rng.shuffle(items)
@@ -758,9 +494,7 @@ def _sample_tokens(logits, temperature=0.0, top_p=None,
 # ─── External Qwen-Instruct judge ────────────────────────────────────
 
 class QwenInstructJudge:
-    """Untrained Qwen2.5-Instruct judge. Loaded lazily on first
-    ``predict_letter`` call. Provides an ``unload`` method to free VRAM.
-    """
+    """Untrained Qwen2.5-Instruct judge, loaded lazily."""
 
     def __init__(self, model_name, device=None):
         self.model_name = model_name
@@ -827,13 +561,7 @@ class QwenInstructJudge:
 @torch.no_grad()
 def qa_select_dream(model, tokenizer, art_token_str, question, options,
                     mask_token_id, meta_prefix=""):
-    """Chat-template MC eval: wrap the QA content in the chat template, append
-    a single ``<mask>`` at the assistant's first-output position, take the
-    argmax, and extract the A-D letter.
-
-    MC format is never taught during training, so this is zero-shot format
-    handling off the instruct prior — the same ask the AR baselines get.
-    """
+    """MC eval: append one <mask> at the assistant position and take the argmax there."""
     qa_content = build_qa_content_with_meta(
         art_token_str, question, options, meta_prefix,
     )
@@ -864,16 +592,7 @@ def qa_select_dream(model, tokenizer, art_token_str, question, options,
 @torch.no_grad()
 def qa_select_dream_gen(model, tokenizer, art_token_str, question, options,
                         mask_token_id, meta_prefix="", n_gen=6, n_steps=6, eps=1e-3):
-    """MC eval by GENERATION (mirrors lit_mc_eval's Dream path): append
-    ``n_gen`` masks after the cue, diffusion-fill them ('ar' schedule), decode,
-    and ``re.search`` the first A-D letter.
-
-    Unlike ``qa_select_dream`` (single-mask argmax), the model writes out the
-    option content, so the chosen letter is content-driven. This avoids the
-    single-token failure mode where an un-injected model emits ``<|endoftext|>``
-    (scoring ~chance) and blunts the answer-order prior that biases the
-    single-token argmax.
-    """
+    """MC eval by generation rather than single-mask argmax."""
     qa_content = build_qa_content_with_meta(
         art_token_str, question, options, meta_prefix,
     )
@@ -901,16 +620,7 @@ def qa_select_dream_gen(model, tokenizer, art_token_str, question, options,
 @torch.no_grad()
 def diffusion_fill_from_cue(model, cue_ids, mask_id, n_gen, n_steps, temperature,
                             alg, alg_temp, top_p, eps):
-    """Fill ``n_gen`` masked positions after a cue prefix.
-
-    Supported algorithms:
-      • ``ar``          — left-to-right one-token-at-a-time unmasking; the
-                          full ``[cue, MASK*n_gen]`` stays in-distribution
-                          for Dream. Requires ``n_gen`` forward passes.
-      • ``origin``      — LLaDA-style random transfer schedule.
-      • ``maskgit_plus`` / ``topk_margin`` / ``entropy`` — confidence-based
-                          batched unmasking.
-    """
+    """Fill n_gen masked positions after a cue prefix."""
     device = next(model.parameters()).device
     cue_len = len(cue_ids)
     x = torch.tensor([list(cue_ids) + [mask_id] * n_gen], dtype=torch.long, device=device)
@@ -983,17 +693,7 @@ def eval_recall_qwen_judge(model, tokenizer, test_qa, article_token_ids,
                            n_gen_tokens, n_steps, temperature,
                            alg, alg_temp, top_p, eps,
                            label="epoch", qwen_judge=None):
-    """Single-cue recall eval with an external Qwen judge.
-
-    Per QA item:
-      1. Dream diffusion-fills a recalled passage from the ``question`` cue,
-         conditioned on the article's special token.
-      2. The Qwen judge sees (meta, recalled_passage, question, options) and
-         emits a single letter A-D, compared against ``gold_letter``.
-
-    Returns ``(aggregate_metrics, per_QA_records)``. The judge is unloaded at
-    the end to free VRAM before training resumes.
-    """
+    """Single-cue recall eval scored by an external Qwen judge."""
     model.eval()
     records = []
     n_correct = 0
@@ -1001,11 +701,7 @@ def eval_recall_qwen_judge(model, tokenizer, test_qa, article_token_ids,
     t0 = time.time()
 
     def _build_cue(art_token_str, meta_prefix_str, query):
-        """Return prompt token ids for the recall cue: user message
-        "Based on the article <art>\\n{meta}\\n\\n{query}" through
-        <|im_start|>assistant\\n. ``diffusion_fill_from_cue`` then appends
-        ``n_gen_tokens`` masks and fills them.
-        """
+        """Return prompt token ids for the recall cue."""
         user_msg = f"Based on the article {art_token_str}\n{meta_prefix_str}\n\n{query}"
         prompt_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": user_msg}],
@@ -1070,9 +766,7 @@ def eval_recall_qwen_judge(model, tokenizer, test_qa, article_token_ids,
 # ─── Run name ────────────────────────────────────────────────────────
 
 def build_run_name(args):
-    """Compose a run name that encodes dataset + core hyperparams. The
-    dataset prefix keeps runs from different datasets disambiguated on disk.
-    """
+    """Compose a run name encoding dataset and core hyperparameters."""
     ts = datetime.now().strftime("%m%d_%H%M")
     rtag = "rfull" if args.recall_n_eval_samples <= 0 else f"r{args.recall_n_eval_samples}"
     mode = "_post" if args.post_train else ""
@@ -1136,10 +830,11 @@ def main():
                              "'all' keeps the treatment uniform across the "
                              "single- vs multi-token strata; 'multi' converts "
                              "only the names that currently cost >1 token")
-    parser.add_argument("--booktok_vocab", default="len83dna_booktok_vocab.json",
-                        help="booktok mode only: written by build_booktok_data.py")
-    parser.add_argument("--entity_vocab", default="len83_entity_vocab.json",
-                        help="built by build_entity_vocab.py, read from DATA_DIR")
+    parser.add_argument("--booktok_vocab", default=None,
+                        help="booktok mode only")
+    parser.add_argument("--entity_vocab", default="len50dna_entity_vocab.json",
+                        help="read from DATA_DIR; must match the corpus -- a "
+                             "mismatch masks the wrong spans without erroring")
     parser.add_argument("--dynamic_chunking", action="store_true",
                         help="Re-chunk the corpus before every epoch with a fresh "
                              "per-article random word offset, so chunk boundaries "
@@ -1234,11 +929,7 @@ def main():
                              "the points wanted are not evenly spaced and each "
                              "probe costs 1038 open-ended generations.")
     parser.add_argument("--episodic_items_file", type=str, default=None,
-                        help="覆盖 DATASETS[dataset]['episodic_items_file']。加这个开关是因为"
-                             "训练中的 episodic 探针只从 ds_cfg 取题库(:1752),没有 CLI 入口;"
-                             "quality_deanaph 那条把它设成 None(去代词语料的探针 item 尚未重新"
-                             "生成),但按原文本的 item 去探是 len83 那批 DNA 模型一直在用的口径,"
-                             "要跨数据集可比就得能显式传进来。")
+                        help="override DATASETS[dataset]['episodic_items_file']")
     parser.add_argument("--episodic_every_n_epochs", type=int, default=0,
                         help="Run the episodic probe every N epochs (0 = off). "
                              "Also fires at epoch0_pretrain and at the final epoch.")
@@ -1249,8 +940,7 @@ def main():
     parser.add_argument("--recall_n_eval_samples", type=int, default=-1)
     parser.add_argument("--recall_qa_file", type=str, default=None,
                         help="if set, recall eval uses ALL QAs from this file "
-                             "(e.g. quality_qa_sample50.jsonl) instead of "
-                             "sampling from qa_test_file")
+                             "instead of sampling from qa_test_file")
     args = parser.parse_args()
     args.recall_eps = 1e-3
 
@@ -1322,33 +1012,21 @@ def main():
     print(f"External Qwen judge: {QWEN_JUDGE_MODEL} (lazy load)")
 
     # ─── Training data assembly ─────────────────────────────────────
-    # chunk-query 那一路(qa_gen)已从本脚本移除。本方法只训练语料本身 + 少量 instruct
-    # 防遗忘,不再合成 question→passage 样本;所有在跑的 run 都传 --chunkq_per_chunk 0,
-    # 那条分支产出恒为 [],是死代码。留着它的代价不只是白读一遍 chunkq 文件,更是配置里
-    # 必须挂一个用不上的路径 —— 而去代词语料的 chunk queries 尚未重新生成,谁把
-    # --chunkq_per_chunk 调回非 0,就会拿旧文本喂 qa_gen、新文本喂 corpus_chat,不报错
-    # 但结果是错的(literaryqa40_deanaph 踩过这个坑)。
-    #
-    # --chunkq_per_chunk / --chunkq_file / --chunkq_select 三个参数**保留但不再生效**:
-    # 正在跑的 d26_span40 / d26_btok40 命令行里带着 --chunkq_per_chunk 0,链式续跑时会
-    # 重新解析本文件的 argparse,删掉参数会让 resume 直接报 unrecognized argument 而死。
-    # 传 0 静默通过(与移除前逐字等价),传非 0 立刻报错而不是悄悄忽略。
+    # chunk-query (qa_gen) was removed. --chunkq_per_chunk / --chunkq_file /
+    # --chunkq_select are kept but inert so chained resume does not die on an
+    # unrecognized argument: 0 passes silently, non-zero raises.
     if not args.post_train and args.chunkq_per_chunk:
         raise SystemExit(
-            f"--chunkq_per_chunk {args.chunkq_per_chunk}: chunk-query 生成已从本脚本移除,"
-            f"只接受 0。需要这条路径请用 diffusion_train.py,或先从当前语料重新生成 "
-            f"chunk queries 再把该功能单独实现在新脚本里。")
+            f"--chunkq_per_chunk {args.chunkq_per_chunk}: chunk-query generation was removed from this script; only 0 is accepted.")
 
-    # post_train 模式:instruct-only,不用语料。
+    # post_train: instruct-only, no corpus.
     instruct_only_data = build_instruct_gen_data_chat(
         tokenizer, args.instruct_file, seed=args.random_seed,
         max_length=args.max_seq_length,
     ) if args.post_train else []
 
     def make_corpus_data(epoch):
-        """Rebuild corpus_chat data for the given epoch. In post-train mode,
-        no corpus is used (returns empty list).
-        """
+        """Rebuild corpus_chat data for the given epoch."""
         if args.post_train:
             return []
         # seed=None keeps offset 0 for every article (the fixed-chunk behaviour).
@@ -1430,9 +1108,7 @@ def main():
 
     test_qa = load_test_qa(ds_cfg["qa_test_file"])
     if args.recall_qa_file:
-        # Recall on a fixed QA file (ALL of it, no sampling) — e.g. the 853
-        # sample50 QAs, so the recall curve is directly comparable to the
-        # earlier sample50 experiment.
+        # Recall on a fixed QA file, all of it, no sampling.
         recall_test_qa = load_jsonl(DATA_DIR / args.recall_qa_file)
         print(f"Recall eval: ALL {len(recall_test_qa)} QAs from "
               f"{args.recall_qa_file}")
@@ -1447,10 +1123,7 @@ def main():
     cli_args = args
 
     class EvalCallback(TrainerCallback):
-        """Runs MC-letter (``run_qa``) and recall pipeline (``run_recall``)
-        evals at configurable cadences. Also rotates the training dataset
-        each epoch when dynamic chunking is on.
-        """
+        """Runs the MC, recall, genQA and episodic evaluations on the configured cadence."""
 
         _last_preds = None
         trainer = None
@@ -1716,19 +1389,7 @@ def main():
                 )
 
         def _run_genqa(self, label, model, hf_args):
-            """Free-form LiteraryQA answers, scored the NarrativeQA way.
-
-            Must be called from inside ``_run_eval`` for the same reason as
-            ``_run_episodic``: it relies on that method's ``model.eval()``.
-
-            The prompt carries the book's ``<lit_NNNNN>`` token, because that is
-            where injection put the knowledge -- asking without it is asking a
-            question the model was never trained on. Answers are short, so the
-            mask budget is 32 rather than the episodic probe's 160.
-
-            Scoring is shared with the AR side (eval_genqa_lit.write_results) so
-            a diffusion number and a baseline number mean the same thing.
-            """
+            """Free-form answers scored with METEOR / ROUGE-L / BLEU."""
             base = str(Path(__file__).resolve().parent.parent / "src_baseline")
             if base not in sys.path:
                 sys.path.insert(0, base)
@@ -1789,13 +1450,7 @@ def main():
                   f"missing_token={missing}  {time.time() - started:.0f}s", flush=True)
 
         def _run_episodic(self, label, model, hf_args):
-            """Answer the episodic_context probe with the live weights.
-
-            Must be called from inside ``_run_eval`` — it relies on that method's
-            ``model.eval()``; running in train() would leave dropout on.
-
-            Writes ``episodic_<label>.jsonl`` into the run dir.
-            """
+            """Answer the episodic probe with the live weights."""
             # probe_lib lives with the probe; imported lazily so a broken probe
             # checkout cannot stop a training run from starting.
             probe_code = str(Path(__file__).resolve().parent.parent
@@ -1840,10 +1495,7 @@ def main():
                                     if t in stop_tokens), len(filled))
                     answer = tokenizer.decode(filled[:stop_at],
                                               skip_special_tokens=True).strip()
-                    # 与 genQA 路径同样的还原,同样按 mode 门控。漏掉这一步时
-                    # btok 会答出 " <e0_Hepzibah>" 而 gold_span 写的是
-                    # "Hepzibah",lexical_metrics 和后续的 judge_facts3 都判零 ——
-                    # 看起来像"模型什么都没记住",实际是没解码回明文。
+                    # de-sentinelise before scoring, as in the genQA path
                     if cli_args.entity_mode == "booktok":
                         answer = entity_mask.desentinel(answer).strip()
                 rows.append({

@@ -1,10 +1,5 @@
 #!/bin/bash
-# EntDiff on NarrativeQA (the 50-book subset): MC peak .6068 @ epoch 35,
-# episodic Hit Ratio peak .1459 @ epoch 50.
-#
-# --entity_vocab MUST be given explicitly. The flag's default points at the
-# 83-book vocabulary; training the 50-book corpus against it does not error,
-# it just masks the wrong spans.
+# --entity_vocab must be passed explicitly; its default is a different corpus.
 #SBATCH -J entdiff_nqa
 #SBATCH -N 1 --ntasks-per-node=1 --cpus-per-task=8 --mem=96G --gres=gpu:1
 #SBATCH -t 16:00:00

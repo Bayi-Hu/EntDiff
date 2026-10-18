@@ -1,36 +1,9 @@
-"""
-judge_facts3.py — label every gold fact hit / distorted / missing.
+"""Grade probe answers against pre-computed atomic facts.
 
-judge_facts.py counts hits only, which collapses two very different failures into
-the same zero: a model that reports the right moment and gets it wrong, and a
-model that never touches that moment at all. With 85-92% of items scoring no
-hits, almost all of the between-method signal is squeezed out of the one bit
-that remains.
+Each fact is labelled H (conveyed), D (that moment, materially wrong) or M (not
+touched). Resumable: already-graded question ids are skipped.
 
-Here each fact gets one of three labels:
-
-    H  PRED conveys the fact
-    D  PRED reports that same moment but materially wrong -- wrong participant,
-       reversed outcome, contradicted detail
-    M  PRED does not touch that moment at all
-
-H + D + M = k, and three numbers fall out of it:
-
-    recall    H / k          what judge_facts.py measured
-    coverage  (H+D) / k      how much of the passage the answer aimed at
-    fidelity  H / (H+D)      of what it aimed at, how much it got right
-
-D vs M is a factual determination about one fact, not a threshold on the answer
-as a whole, so it should keep the stability that made counting work: two
-gradings of the same file under judge_facts.py differed by 0.0002, against 0.10
-for a holistic 0/1/2 rubric.
-
-This does not replace judge_facts.py. Both read the same frozen fact lists from
-build_gold_facts.py, and H here is defined identically, so recall is comparable
-across the two scripts.
-
-Usage:
-  python judge_facts3.py --answers <path|name> --method <name> [--limit 200]
+Usage: python judge_facts3.py --answers <path> --facts <file> --method <name>
 """
 import argparse, json, re, subprocess
 from collections import Counter
@@ -200,9 +173,9 @@ def main():
     print(f"  fidelity {fid:.4f}   (of what it aimed at)")
     print(f"  H={H}  D={D}  M={K-H-D}")
     z = sum(1 for g in got if g["H"] == 0 and g["D"] == 0)
-    print(f"  完全没碰 GOLD 的题: {z}/{len(got)} = {z/n:.1%}")
+    print(f"  items that never touched GOLD: {z}/{len(got)} = {z/n:.1%}")
     if len(got) < len(rows):
-        print(f"  未评 {len(rows)-len(got)} 题 — 重跑同一命令即可续上")
+        print(f"  {len(rows)-len(got)} items ungraded -- rerun the same command to resume")
 
 
 if __name__ == "__main__":

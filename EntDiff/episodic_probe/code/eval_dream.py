@@ -1,22 +1,8 @@
-"""
-eval_dream.py — answer the episodic_context probe with a Dream-7B diffusion
-checkpoint. Closed-book via the per-article special token.
+"""Answer the episodic probe with a diffusion checkpoint, closed-book via the
+per-article special token. Decoding fills a contiguous mask block leftmost-first;
+the mask count is part of the input, so n_gen is a length command, not a ceiling.
 
-Prompt (built by pl.epctx_prompt with art_tok, the ONLY prompt version in use):
-    Based on Article <quality_art_N> "TITLE" by AUTHOR, what is the context that
-    comes immediately {before|after} the sentence: "<anchor>"?
-
-Byte-identical to what eval_qwen.py feeds the AR models except for the article
-token — that token is the asymmetry being probed.
-
-Decoding: diffusion_fill_from_cue with alg="ar" (leftmost-first unmasking of a
-contiguous mask block). NOTE the mask count IS part of the input: n_gen is fixed
-before the first forward pass and the model fills essentially all of it (528/530
-items hit the cap), so n_gen is a length COMMAND, not a ceiling. It is currently
-derived from the gold length, which leaks how long the answer should be.
-
-Usage:
-  python eval_dream.py --checkpoint <dir> --method_tag dream_ep40
+Usage: python eval_dream.py --checkpoint <dir> --method_tag <tag>
 """
 import argparse, sys, time
 from pathlib import Path
@@ -26,8 +12,8 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-# diffusion_train.py 未随包发布。这两个函数在 diffusion_train_entity.py 里是
-# 逐字相同的实现(已按 AST 源码段 SHA 核对),所以改从后者导入,行为不变。
+# diffusion_train.py is not shipped; both functions are byte-identical in
+# diffusion_train_entity.py (verified by hashing the AST source segments).
 from diffusion_train_entity import (diffusion_fill_from_cue,  # noqa: E402
                                     load_dream_model_with_tokens)
 import entity_mask  # noqa: E402
@@ -61,14 +47,14 @@ def fill_open(model, tok, cue, mask_id, n_gen):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=pl.CKPT["diffusion_c64"])
+    ap.add_argument("--checkpoint", required=True,
+                    help="trained checkpoint directory")
     ap.add_argument("--method_tag", default="dream_ep40")
     ap.add_argument("--out_tag", default="")
     ap.add_argument("--items_file", default=ITEMS_FILE)
     ap.add_argument("--corpus_file", default="quality_corpus_clean.jsonl",
                     help="corpus whose per-article tokens to add when the "
-                         "checkpoint has none (untrained-Dream floor row only); "
-                         "len83 runs need lit_len83_corpus.jsonl")
+                         "checkpoint has none (untrained-Dream floor row only); ")
     ap.add_argument("--art_probe", default="quality_art_0",
                     help="article id used to test whether this checkpoint "
                          "already carries per-article tokens")

@@ -1,10 +1,5 @@
 #!/bin/bash
-# EntDiff on QuALITY: de-anaphorised corpus + entity-span masking, Dream-7B.
-# Reproduces the run reported as "EntDiff (span)" on QuALITY (MC peak .5376 @ epoch 42).
-#
-# Paths are resolved relative to this script, so the release directory can be
-# moved anywhere. Adjust the SBATCH block for your scheduler, or drop it and run
-# the python command directly on a single 80GB GPU.
+# --entity_vocab must be passed explicitly; its default is a different corpus.
 #SBATCH -J entdiff_qual
 #SBATCH -N 1 --ntasks-per-node=1 --cpus-per-task=8 --mem=96G --gres=gpu:1
 #SBATCH -t 16:00:00
