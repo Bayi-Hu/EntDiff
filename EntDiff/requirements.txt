@@ -1,0 +1,10 @@
+# Versions used for the reported runs. Newer minor versions are likely fine,
+# but transformers>=5 removes TRANSFORMERS_CACHE and changes SFTConfig fields.
+torch==2.11.0
+transformers==4.57.6
+trl==0.29.0
+datasets==4.5.0
+accelerate
+sentencepiece
+# Only needed to regenerate the synthetic baselines, not to train or evaluate EntDiff:
+# vllm==0.22.1
